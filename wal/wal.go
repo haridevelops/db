@@ -27,6 +27,7 @@ type Wal struct {
 	currentSegment      *os.File
 	lock                sync.Mutex
 	lastLogSequenceNo   uint64
+	lastCheckpointLSN   uint64 // Last checkpoint log sequence number
 	bufferWriter        *bufio.Writer
 	syncTimer           *time.Timer
 	triggerFSync        bool
@@ -51,8 +52,9 @@ func (wal *Wal) Write(data []byte) error {
 	wal.lastLogSequenceNo++
 	walDataLog := &Wal_Data_Log{
 		LogSequenceNumber: wal.lastLogSequenceNo,
+		Type:              Log_Type_DATA,
 		Data:              data,
-		// change to CRC32 castagnoli
+		// TODO: change to CRC32 castagnoli, read first and change
 		CRC: crc32.ChecksumIEEE(append(data, byte(wal.lastLogSequenceNo))),
 	}
 
@@ -75,7 +77,7 @@ func (wal *Wal) _rotateLog(currentDataLogSize int32) error {
 }
 
 func (wal *Wal) rotateLog() error {
-	if err := wal.Sync(); err != nil {
+	if err := wal.Sync(false); err != nil {
 		return err
 	}
 
@@ -85,12 +87,12 @@ func (wal *Wal) rotateLog() error {
 	fmt.Printf("[DEBUG] Rotating log: closing segment index: %d\n", wal.currentSegmentIndex)
 	wal.currentSegmentIndex++
 	if wal.currentSegmentIndex >= wal.maxSegments {
-		if err := wal.deleteOldestSegment(); err != nil {
+		if err := wal.moveOldestSegmentToArchival(); err != nil {
 			return err
 		}
 	}
 	fmt.Printf("[DEBUG] Rotating log: new segment index: %d\n", wal.currentSegmentIndex)
-	newFile, err := createSegmentFile(wal.logDirectory, wal.currentSegmentIndex)
+	newFile, err := CreateSegmentFile(wal.logDirectory, wal.currentSegmentIndex)
 	if err != nil {
 		return err
 	}
@@ -101,7 +103,7 @@ func (wal *Wal) rotateLog() error {
 	return nil
 }
 
-func (wal *Wal) deleteOldestSegment() error {
+func (wal *Wal) moveOldestSegmentToArchival() error {
 	files, err := filepath.Glob(filepath.Join(wal.logDirectory, segmentPrefix+"*"))
 	if err != nil {
 		return err
@@ -118,8 +120,15 @@ func (wal *Wal) deleteOldestSegment() error {
 		return nil
 	}
 
-	// Delete the oldest segment file
-	if err := os.Remove(oldestSegmentFilePath); err != nil {
+	fmt.Printf("[DEBUG] Moving oldest segment file: %s\n", oldestSegmentFilePath)
+	// Move the oldest segment file to archival
+	fileName := strings.Split(oldestSegmentFilePath, "/")[len(strings.Split(oldestSegmentFilePath, "/"))-1]
+	archivalDirectory := filepath.Join("data", "archival")
+	archivalFilePath := filepath.Join(archivalDirectory, fileName)
+	if err := os.MkdirAll(archivalDirectory, 0755); err != nil {
+		return err
+	}
+	if err := os.Rename(oldestSegmentFilePath, archivalFilePath); err != nil {
 		return err
 	}
 
@@ -169,23 +178,23 @@ func (wal *Wal) writeDataLogToBuffer(walDataLog *Wal_Data_Log) error {
 }
 
 func NewWal(logDirectory string, maxFileSize int64, maxSegments int, triggerFSync bool) (*Wal, error) {
-	createDirectoryIfNotExists(logDirectory)
-	files, err := readSegmentFiles(logDirectory)
+	CreateDirectoryIfNotExists(logDirectory)
+	files, err := ReadSegmentFiles(logDirectory)
 	if err != nil {
 		return nil, err
 	}
 
-	err = createANewSegmentFileIfNotExists(logDirectory, files)
+	err = CreateANewSegmentFileIfNotExists(logDirectory, files)
 	if err != nil {
 		return nil, err
 	}
 
-	lastSegmentFileNo, err := getLastSegmentFileNo(files)
+	lastSegmentFileNo, err := GetLastSegmentFileNo(files)
 	if err != nil {
 		return nil, err
 	}
 
-	file, err := openSegmentFile(logDirectory, lastSegmentFileNo)
+	file, err := OpenSegmentFile(logDirectory, lastSegmentFileNo)
 	if err != nil {
 		return nil, err
 	}
@@ -225,7 +234,7 @@ func (wal *Wal) houseKeeping() {
 		case <-wal.syncTimer.C:
 
 			wal.lock.Lock()
-			err := wal.Sync()
+			err := wal.Sync(true)
 			wal.lock.Unlock()
 
 			if err != nil {
@@ -238,13 +247,17 @@ func (wal *Wal) houseKeeping() {
 	}
 }
 
-func (wal *Wal) Sync() error {
+func (wal *Wal) Sync(shouldCheckpointed bool) error {
 	if err := wal.bufferWriter.Flush(); err != nil {
 		return err
 	}
 	if wal.triggerFSync {
 		if err := wal.currentSegment.Sync(); err != nil {
 			return err
+		}
+
+		if shouldCheckpointed {
+			wal.checkpoint()
 		}
 	}
 
@@ -265,6 +278,10 @@ func (wal *Wal) getLastLogSequenceNo() (uint64, error) {
 	defer file.Close()
 
 	var lastDataLog *Wal_Data_Log
+
+	if _, err := file.Seek(16, io.SeekStart); err != nil {
+		panic(err)
+	}
 
 	for {
 		var size int32
@@ -287,7 +304,7 @@ func (wal *Wal) getLastLogSequenceNo() (uint64, error) {
 			return 0, err
 		}
 
-		walDataLog, err := unmarshalAndVerifyDataLog(data)
+		walDataLog, err := UnmarshalAndVerifyDataLog(data)
 		if err != nil {
 			return 0, err
 		}
@@ -301,93 +318,9 @@ func (wal *Wal) getLastLogSequenceNo() (uint64, error) {
 	return lastDataLog.LogSequenceNumber, nil
 }
 
-func unmarshalAndVerifyDataLog(data []byte) (*Wal_Data_Log, error) {
-	var walDataLog Wal_Data_Log
-	if err := proto.Unmarshal(data, &walDataLog); err != nil {
-		return nil, err
-	}
-	if validDataIntegrity(&walDataLog) {
-		return &walDataLog, nil
-	} else {
-		return nil, fmt.Errorf("data integrity check failed")
-	}
-
-}
-
-func openSegmentFile(logDirectory string, lastSegmentFileNo int) (*os.File, error) {
-	filePath := filepath.Join(logDirectory, fmt.Sprintf("%s%d%s", segmentPrefix, lastSegmentFileNo, segmentSuffix))
-	file, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return nil, err
-	}
-	return file, nil
-}
-
-func validDataIntegrity(walDataLog *Wal_Data_Log) bool {
-	return walDataLog.CRC == crc32.ChecksumIEEE(append(walDataLog.Data, byte(walDataLog.LogSequenceNumber)))
-}
-
-func createANewSegmentFileIfNotExists(logDirectory string, files []string) error {
-	if len(files) <= 0 {
-		// create a new segment file
-		segmentFile, err := createSegmentFile(logDirectory, 0)
-		if err != nil {
-			return err
-		}
-
-		if err := segmentFile.Close(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func getLastSegmentFileNo(files []string) (int, error) {
-	var lastSegmentFileNo int
-	for _, file := range files {
-		_, fileName := filepath.Split(file)
-		segmentString := strings.TrimPrefix(fileName, segmentPrefix)
-		segmentString = strings.TrimSuffix(segmentString, segmentSuffix)
-		currentSegmentFileNo, err := strconv.Atoi(segmentString)
-		if err != nil {
-			return 0, err
-		}
-		if currentSegmentFileNo > lastSegmentFileNo {
-			lastSegmentFileNo = currentSegmentFileNo
-		}
-	}
-	return lastSegmentFileNo, nil
-}
-
-func createSegmentFile(directory string, segmentFileNo int) (*os.File, error) {
-	filePath := filepath.Join(directory, fmt.Sprintf("%s%d%s", segmentPrefix, segmentFileNo, segmentSuffix))
-	file, err := os.Create(filePath)
-	if err != nil {
-		return nil, err
-	}
-	return file, nil
-}
-
-func readSegmentFiles(logDirectory string) ([]string, error) {
-	fileName := filepath.Join(logDirectory, segmentPrefix+"*"+segmentSuffix)
-	files, err := filepath.Glob(fileName)
-	if err != nil {
-		return nil, err
-	}
-	return files, err
-}
-
-func createDirectoryIfNotExists(logDirectory string) error {
-	err := os.MkdirAll(logDirectory, 0755)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
 func (wal *Wal) Close() error {
 	wal.cancel()
-	if err := wal.Sync(); err != nil {
+	if err := wal.Sync(true); err != nil {
 		return err
 	}
 	return wal.currentSegment.Close()
@@ -401,7 +334,7 @@ func (wal *Wal) ReadCurrentSegmentFile() ([]*Wal_Data_Log, error) {
 
 	defer file.Close()
 
-	dataLogs, err := readAllDataLogs(file)
+	dataLogs, err := ReadAllDataLogs(file)
 	if err != nil {
 		return nil, err
 	}
@@ -409,41 +342,101 @@ func (wal *Wal) ReadCurrentSegmentFile() ([]*Wal_Data_Log, error) {
 	return dataLogs, nil
 }
 
-func readAllDataLogs(file *os.File) ([]*Wal_Data_Log, error) {
-	var dataLogs []*Wal_Data_Log
-	for {
-		var size int32
-		err := binary.Read(file, binary.LittleEndian, &size)
-		fmt.Printf("[DEBUG] Read size: %d, err: %v\n", size, err)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return dataLogs, err
-		}
-
-		if size <= 0 {
-			fmt.Println("[DEBUG] Encountered non-positive size, breaking loop.")
-			break
-		}
-
-		data := make([]byte, size)
-		_, err = io.ReadFull(file, data)
-		fmt.Printf("[DEBUG] ReadFull for %d bytes, err: %v\n", size, err)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return dataLogs, err
-		}
-
-		dataLog, err := unmarshalAndVerifyDataLog(data)
-		if err != nil {
-			fmt.Printf("[DEBUG] Failed to unmarshal/verify data log: %v\n", err)
-			return dataLogs, err
-		}
-		fmt.Printf("[DEBUG] Successfully read data log: SeqNo=%d\n", dataLog.LogSequenceNumber)
-		dataLogs = append(dataLogs, dataLog)
+func (wal *Wal) checkpoint() {
+	// After successful disk sync, write a checkpoint record
+	wal.lastLogSequenceNo++
+	wal.lastCheckpointLSN = wal.lastLogSequenceNo
+	checkpointLog := &Wal_Data_Log{
+		LogSequenceNumber: wal.lastLogSequenceNo,
+		Type:              Log_Type_CHECKPOINT,
+		Data:              []byte{}, // Empty data for checkpoint
+		CRC:               crc32.ChecksumIEEE([]byte{byte(wal.lastLogSequenceNo)}),
 	}
-	return dataLogs, nil
+
+	if err := wal.writeDataLogToBuffer(checkpointLog); err != nil {
+		fmt.Printf("failed to checkpoint: %v\n", err)
+		return
+	}
+}
+
+// Returns last checkpoint record and segment file number containing it
+func (wal *Wal) getLastCheckPointLSNWalEntry() (*Wal_Data_Log, int, error) {
+	// Start from current segment index and work backwards
+	for segmentIndex := wal.currentSegmentIndex; segmentIndex >= 0; segmentIndex-- {
+		// Open segment file
+		segmentPath := filepath.Join(wal.logDirectory, fmt.Sprintf("%s%d%s", segmentPrefix, segmentIndex, segmentSuffix))
+		file, err := os.OpenFile(segmentPath, os.O_RDONLY, 0644)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// Try archive directory
+				segmentPath = filepath.Join("data", "archival", fmt.Sprintf("%s%d%s", segmentPrefix, segmentIndex, segmentSuffix))
+				file, err = os.OpenFile(segmentPath, os.O_RDONLY, 0644)
+				if err != nil {
+					continue // Skip if not found in either location
+				}
+			} else {
+				return nil, 0, err
+			}
+		}
+		defer file.Close()
+
+		// Read all records from this segment
+		records, err := ReadAllDataLogs(file)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		// Search backwards for checkpoint
+		for i := len(records) - 1; i >= 0; i-- {
+			if records[i].Type == Log_Type_CHECKPOINT {
+				return records[i], segmentIndex, nil
+			}
+		}
+	}
+	return nil, 0, fmt.Errorf("no checkpoint found")
+}
+
+func (wal *Wal) RecoverFromCheckpoint() error {
+	// Find last checkpoint
+	checkpoint, segmentIndex, err := wal.getLastCheckPointLSNWalEntry()
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Found Recovery checkpoint at LSN %d in segment %d\n", checkpoint.LogSequenceNumber, segmentIndex)
+
+	// Read and print all records from checkpoint onwards
+	for currSegment := segmentIndex; currSegment <= wal.currentSegmentIndex; currSegment++ {
+		// Try active directory first
+		segmentPath := filepath.Join(wal.logDirectory, fmt.Sprintf("%s%d%s", segmentPrefix, currSegment, segmentSuffix))
+		file, err := os.OpenFile(segmentPath, os.O_RDONLY, 0644)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// Try archive directory
+				segmentPath = filepath.Join("data", "archival", fmt.Sprintf("%s%d%s", segmentPrefix, currSegment, segmentSuffix))
+				file, err = os.OpenFile(segmentPath, os.O_RDONLY, 0644)
+				if err != nil {
+					return err
+				}
+			} else {
+				return err
+			}
+		}
+		defer file.Close()
+
+		records, err := ReadAllDataLogs(file)
+		if err != nil {
+			return err
+		}
+
+		// Print records after checkpoint LSN
+		for _, record := range records {
+			if record.LogSequenceNumber > checkpoint.LogSequenceNumber {
+				fmt.Printf("Replay record: LSN=%d, Type=%v, Data=%s\n",
+					record.LogSequenceNumber, record.Type, string(record.Data))
+			}
+		}
+	}
+
+	return nil
 }

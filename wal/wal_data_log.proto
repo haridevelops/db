@@ -4,6 +4,12 @@ option go_package = "github.com/haridevelops/wal/wal";
 
 message Wal_Data_Log {
     uint64   logSequenceNumber = 1;
-    bytes    data = 2;
-    uint32   CRC = 3;
+    Log_Type type = 2;
+    bytes    data = 3;
+    uint32   CRC = 4;
+}
+
+enum Log_Type {
+    DATA = 0;
+    CHECKPOINT = 1;
 }
